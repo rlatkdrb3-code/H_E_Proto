@@ -15,16 +15,11 @@ void main() {
 
 enum PrototypeVariant { a, b }
 
-const _defaultSheetEndpoint =
-    'https://script.google.com/macros/s/AKfycbxPIHJYPo0VotYjlftKwe4rtaQ-0mOKyD7elNp-wCtEEYjQ84hmbWLA2O9tMnwYIZGw/exec';
-const _defaultSheetToken = 'a6d087b47cddd90b7b0b9b1cf6ea4a26';
 const _sheetEndpoint = String.fromEnvironment(
   'SHEET_ENDPOINT',
-  defaultValue: _defaultSheetEndpoint,
 );
 const _sheetToken = String.fromEnvironment(
   'SHEET_TOKEN',
-  defaultValue: _defaultSheetToken,
 );
 
 class ToolSwitchLog {
@@ -340,7 +335,7 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
     if (!mounted) {
       return;
     }
-    if (_sheetEndpoint.isEmpty) {
+    if (_sheetEndpoint.isEmpty || _sheetToken.isEmpty) {
       return;
     }
     setState(() {

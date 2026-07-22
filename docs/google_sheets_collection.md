@@ -2,9 +2,8 @@
 
 ## Sheet columns
 
-Created sheet:
-
-https://docs.google.com/spreadsheets/d/1aQM3jwwH3hyc5hz5Ol7MJt-CJZWU6FKUTZClWa6qu_o/edit
+Create a private sheet for pseudonymous experiment IDs. Do not commit the
+sheet URL, Apps Script deployment URL, or collection token.
 
 The first row has already been created:
 
@@ -17,9 +16,9 @@ userID	Type	trial	Timestamp	isTemporaryMode	From	To	accessDuration(sec)	switchDu
 Open the sheet, then go to `Extensions > Apps Script` and paste this code.
 
 ```javascript
-const SPREADSHEET_ID = '1aQM3jwwH3hyc5hz5Ol7MJt-CJZWU6FKUTZClWa6qu_o';
+const SPREADSHEET_ID = '<YOUR_SPREADSHEET_ID>';
 const SHEET_NAME = 'Sheet1';
-const TOKEN = 'a6d087b47cddd90b7b0b9b1cf6ea4a26';
+const TOKEN = '<RANDOM_SHARED_SECRET>';
 
 function doPost(e) {
   const payload = JSON.parse(e.postData.contents || '{}');
@@ -80,8 +79,9 @@ Use the copied web app URL and the same token from the script.
 
 ```bash
 flutter run \
-  --dart-define=SHEET_ENDPOINT='https://script.google.com/macros/s/AKfycbxPIHJYPo0VotYjlftKwe4rtaQ-0mOKyD7elNp-wCtEEYjQ84hmbWLA2O9tMnwYIZGw/exec' \
-  --dart-define=SHEET_TOKEN='a6d087b47cddd90b7b0b9b1cf6ea4a26'
+  --dart-define=SHEET_ENDPOINT='<YOUR_APPS_SCRIPT_WEB_APP_URL>' \
+  --dart-define=SHEET_TOKEN='<SAME_SHARED_SECRET>'
 ```
 
-For release builds, pass the same values to `flutter build`.
+For release builds, pass the same values to `flutter build`. Rotate the shared
+secret immediately if it is ever committed or otherwise exposed.
