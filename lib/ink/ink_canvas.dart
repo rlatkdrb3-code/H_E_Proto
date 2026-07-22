@@ -19,6 +19,8 @@ class InkAnnotationLayer extends StatefulWidget {
   final List<InkStroke> strokes;
   final ValueChanged<List<InkStroke>> onChanged;
   final ValueChanged<bool>? onStrokeActiveChanged;
+  final ValueChanged<DateTime>? onInkPointerDown;
+  final ValueChanged<DateTime>? onInkPointerUp;
   final Widget child;
 
   const InkAnnotationLayer({
@@ -31,6 +33,8 @@ class InkAnnotationLayer extends StatefulWidget {
     required this.strokes,
     required this.onChanged,
     this.onStrokeActiveChanged,
+    this.onInkPointerDown,
+    this.onInkPointerUp,
     required this.child,
   });
 
@@ -103,6 +107,7 @@ class _InkAnnotationLayerState extends State<InkAnnotationLayer> {
     if (isStylusPointerKind(event.kind)) {
       _replaceActivePoints([_pointFor(event.localPosition)]);
     }
+    widget.onInkPointerDown?.call(DateTime.now());
     widget.onStrokeActiveChanged?.call(true);
   }
 
@@ -163,6 +168,7 @@ class _InkAnnotationLayerState extends State<InkAnnotationLayer> {
       _pendingStrokeStart = null;
       _pendingPointerKind = null;
       _pendingStrokeStartedAt = 0;
+      widget.onInkPointerUp?.call(DateTime.now());
       widget.onStrokeActiveChanged?.call(false);
     }
     if (_activePointers.isEmpty) {

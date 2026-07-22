@@ -1,4 +1,4 @@
-package com.example.kh_battle_ink_prototype
+package com.teamtest.proto
 
 import io.flutter.embedding.android.FlutterActivity
 

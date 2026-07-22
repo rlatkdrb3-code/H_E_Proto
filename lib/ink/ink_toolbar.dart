@@ -13,6 +13,7 @@ class InkToolbar extends StatelessWidget {
   final bool showUtilityActions;
   final ValueChanged<bool> onEnabledChanged;
   final ValueChanged<int> onPresetSelected;
+  final ValueChanged<int>? onPresetPointerDown;
   final VoidCallback onCustomize;
   final VoidCallback onUndo;
   final VoidCallback onClear;
@@ -28,6 +29,7 @@ class InkToolbar extends StatelessWidget {
     this.showUtilityActions = true,
     required this.onEnabledChanged,
     required this.onPresetSelected,
+    this.onPresetPointerDown,
     required this.onCustomize,
     required this.onUndo,
     required this.onClear,
@@ -48,6 +50,7 @@ class InkToolbar extends StatelessWidget {
           _InkPresetButton(
             preset: presets[index],
             selected: selectedPresetIndex == index,
+            onPointerDown: () => onPresetPointerDown?.call(index),
             onTap: () => onPresetSelected(index),
           ),
         if (showUtilityActions) ...[
@@ -131,40 +134,46 @@ class _InkIconButton extends StatelessWidget {
 class _InkPresetButton extends StatelessWidget {
   final InkPreset preset;
   final bool selected;
+  final VoidCallback? onPointerDown;
   final VoidCallback onTap;
 
   const _InkPresetButton({
     required this.preset,
     required this.selected,
+    this.onPointerDown,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    return Listener(
       behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      child: Container(
-        width: 46,
-        height: 46,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? const Color(0xFFEEF1FF) : Colors.transparent,
-          borderRadius: BorderRadius.circular(12),
-          border: selected
-              ? Border.all(color: const Color(0xFFBFCBFF), width: 1.2)
-              : null,
+      onPointerDown: (_) => onPointerDown?.call(),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: Container(
+          width: 46,
+          height: 46,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: selected ? const Color(0xFFEEF1FF) : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+            border: selected
+                ? Border.all(color: const Color(0xFFBFCBFF), width: 1.2)
+                : null,
+          ),
+          child: preset.isEraser
+              ? const Icon(
+                  Icons.cleaning_services_rounded,
+                  size: 20,
+                  color: Color(0xFF64748B),
+                )
+              : CustomPaint(
+                  size: const Size(24, 24),
+                  painter: InkPresetPreviewPainter(preset),
+                ),
         ),
-        child: preset.isEraser
-            ? const Icon(
-                Icons.cleaning_services_rounded,
-                size: 20,
-                color: Color(0xFF64748B),
-              )
-            : CustomPaint(
-                size: const Size(24, 24),
-                painter: InkPresetPreviewPainter(preset),
-              ),
       ),
     );
   }

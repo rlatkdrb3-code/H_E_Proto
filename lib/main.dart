@@ -1,5 +1,9 @@
+import 'dart:convert';
+import 'dart:async';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 
 import 'ink/ink_canvas.dart';
 import 'ink/ink_models.dart';
@@ -10,6 +14,71 @@ void main() {
 }
 
 enum PrototypeVariant { a, b }
+
+const _defaultSheetEndpoint =
+    'https://script.google.com/macros/s/AKfycbxPIHJYPo0VotYjlftKwe4rtaQ-0mOKyD7elNp-wCtEEYjQ84hmbWLA2O9tMnwYIZGw/exec';
+const _defaultSheetToken = 'a6d087b47cddd90b7b0b9b1cf6ea4a26';
+const _sheetEndpoint = String.fromEnvironment(
+  'SHEET_ENDPOINT',
+  defaultValue: _defaultSheetEndpoint,
+);
+const _sheetToken = String.fromEnvironment(
+  'SHEET_TOKEN',
+  defaultValue: _defaultSheetToken,
+);
+
+class ToolSwitchLog {
+  final int trial;
+  final DateTime timestamp;
+  final int? elapsedMs;
+  final bool isTemporaryMode;
+  final String from;
+  final String to;
+  final int? accessDurationMs;
+  int? switchDurationMs;
+  final bool misoperation;
+
+  ToolSwitchLog({
+    required this.trial,
+    required this.timestamp,
+    required this.elapsedMs,
+    required this.isTemporaryMode,
+    required this.from,
+    required this.to,
+    required this.accessDurationMs,
+    this.switchDurationMs,
+    required this.misoperation,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'trial': trial,
+    'timestamp': _formatClockTime(timestamp),
+    'timestampIso': timestamp.toIso8601String(),
+    'elapsedSec': _secondsFromMs(elapsedMs),
+    'elapsedMs': _secondsFromMs(elapsedMs),
+    'isTemporaryMode': isTemporaryMode ? 1 : 0,
+    'from': from,
+    'to': to,
+    'accessDurationSec': _secondsFromMs(accessDurationMs),
+    'accessDurationMs': _secondsFromMs(accessDurationMs),
+    'switchDurationSec': _secondsFromMs(switchDurationMs),
+    'switchDurationMs': _secondsFromMs(switchDurationMs),
+    'misoperation': misoperation ? 1 : 0,
+  };
+
+  static double? _secondsFromMs(int? milliseconds) {
+    if (milliseconds == null) {
+      return null;
+    }
+    return double.parse((milliseconds / 1000).toStringAsFixed(2));
+  }
+
+  static String _formatClockTime(DateTime timestamp) {
+    return '${timestamp.hour.toString().padLeft(2, '0')}:'
+        '${timestamp.minute.toString().padLeft(2, '0')}:'
+        '${timestamp.second.toString().padLeft(2, '0')}';
+  }
+}
 
 class InkLecturePrototypeApp extends StatelessWidget {
   final PrototypeVariant? initialVariant;
@@ -66,14 +135,23 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
   bool _inkEnabled = true;
   bool _isStrokeActive = false;
   bool _isTestRunning = false;
+  bool _isCountdownActive = false;
   bool _bottomPresetTrayOpen = false;
   int? _holdOriginalPresetIndex;
   int? _hoverPresetIndex;
   DateTime? _lastStrokeEndedAt;
+  DateTime? _lastToolPointerDownAt;
   int _switchesSinceStroke = 0;
   bool _misoperationCounted = false;
-  int _misoperationCount = 0;
-  final List<int> _transitionTimesMs = <int>[];
+  DateTime? _testStartedAt;
+  int _trialCounter = 0;
+  bool _isSubmitting = false;
+  int _countdownSeconds = 5;
+  Timer? _countdownTimer;
+  Timer? _testElapsedTimer;
+  int _testElapsedSeconds = 0;
+  String? _userId;
+  final List<ToolSwitchLog> _toolSwitchLogs = <ToolSwitchLog>[];
 
   @override
   void initState() {
@@ -81,20 +159,17 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
     _variant = widget.variant;
   }
 
+  @override
+  void dispose() {
+    _countdownTimer?.cancel();
+    _testElapsedTimer?.cancel();
+    super.dispose();
+  }
+
   InkPreset get _selectedPreset => _presets[_selectedPresetIndex];
   bool get _isVariantB => _variant == PrototypeVariant.b;
   int get _eraserPresetIndex =>
       _presets.indexWhere((preset) => preset.tool == InkTool.eraser);
-  int? get _latestTransitionMs =>
-      _transitionTimesMs.isEmpty ? null : _transitionTimesMs.last;
-  int? get _averageTransitionMs {
-    if (_transitionTimesMs.isEmpty) {
-      return null;
-    }
-    final total = _transitionTimesMs.fold<int>(0, (sum, time) => sum + time);
-    return (total / _transitionTimesMs.length).round();
-  }
-
   void _selectPreset(int index) {
     if (index < 0 || index >= _presets.length) {
       return;
@@ -107,16 +182,201 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
     });
   }
 
-  void _toggleTest() {
+  Future<void> _toggleTest() async {
+    if (_isCountdownActive) {
+      return;
+    }
+    final willStart = !_isTestRunning;
+    if (!willStart) {
+      final logs = List<ToolSwitchLog>.from(_toolSwitchLogs);
+      final startedAt = _testStartedAt;
+      final endedAt = DateTime.now();
+      _stopElapsedTimer(endedAt: endedAt);
+      setState(() {
+        _isTestRunning = false;
+        _lastStrokeEndedAt = null;
+        _lastToolPointerDownAt = null;
+        _switchesSinceStroke = 0;
+        _misoperationCounted = false;
+      });
+      await _submitTestLogs(logs, startedAt: startedAt, endedAt: endedAt);
+      return;
+    }
+    final userId = await _ensureUserId();
+    if (userId == null || !mounted) {
+      return;
+    }
+    _startCountdown(userId);
+  }
+
+  void _startCountdown(String userId) {
+    _countdownTimer?.cancel();
     setState(() {
-      _isTestRunning = !_isTestRunning;
+      _isCountdownActive = true;
+      _countdownSeconds = 5;
+      _userId = userId;
       _inkEnabled = true;
       _lastStrokeEndedAt = null;
+      _lastToolPointerDownAt = null;
       _switchesSinceStroke = 0;
       _misoperationCounted = false;
-      _misoperationCount = 0;
-      _transitionTimesMs.clear();
+      _toolSwitchLogs.clear();
+      _trialCounter = 0;
+      _testElapsedSeconds = 0;
     });
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      if (_countdownSeconds <= 1) {
+        timer.cancel();
+        _beginTestSession(userId);
+        return;
+      }
+      setState(() {
+        _countdownSeconds -= 1;
+      });
+    });
+  }
+
+  void _beginTestSession(String userId) {
+    final startedAt = DateTime.now();
+    setState(() {
+      _isCountdownActive = false;
+      _isTestRunning = true;
+      _inkEnabled = true;
+      _lastStrokeEndedAt = null;
+      _lastToolPointerDownAt = null;
+      _switchesSinceStroke = 0;
+      _misoperationCounted = false;
+      _toolSwitchLogs.clear();
+      _trialCounter = 0;
+      _testStartedAt = startedAt;
+      _userId = userId;
+    });
+    _startElapsedTimer(startedAt);
+  }
+
+  void _startElapsedTimer(DateTime startedAt) {
+    _testElapsedTimer?.cancel();
+    _testElapsedTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) {
+        _testElapsedTimer?.cancel();
+        return;
+      }
+      setState(() {
+        _testElapsedSeconds = DateTime.now().difference(startedAt).inSeconds;
+      });
+    });
+  }
+
+  void _stopElapsedTimer({required DateTime endedAt}) {
+    _testElapsedTimer?.cancel();
+    final startedAt = _testStartedAt;
+    if (startedAt == null || !mounted) {
+      return;
+    }
+    setState(() {
+      _testElapsedSeconds = endedAt.difference(startedAt).inSeconds;
+    });
+  }
+
+  Future<String?> _ensureUserId() async {
+    final current = _userId?.trim();
+    final controller = TextEditingController(text: current ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('피실험자 ID'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'userID',
+              hintText: '예: 7011',
+            ),
+            textInputAction: TextInputAction.done,
+            onSubmitted: (_) {
+              final value = controller.text.trim();
+              if (value.isNotEmpty) {
+                Navigator.pop(context, value);
+              }
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('취소'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final value = controller.text.trim();
+                if (value.isNotEmpty) {
+                  Navigator.pop(context, value);
+                }
+              },
+              child: const Text('시작'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null || result.trim().isEmpty) {
+      return null;
+    }
+    _userId = result.trim();
+    return _userId;
+  }
+
+  Future<void> _submitTestLogs(
+    List<ToolSwitchLog> logs, {
+    required DateTime? startedAt,
+    required DateTime endedAt,
+  }) async {
+    if (!mounted) {
+      return;
+    }
+    if (_sheetEndpoint.isEmpty) {
+      return;
+    }
+    setState(() {
+      _isSubmitting = true;
+    });
+    final payload = {
+      'token': _sheetToken,
+      'userID': _userId ?? '',
+      'type': _variant == PrototypeVariant.a ? 'A' : 'B',
+      'startedAt': startedAt?.toIso8601String(),
+      'endedAt': endedAt.toIso8601String(),
+      'rows': logs.map((log) => log.toJson()).toList(),
+    };
+    try {
+      final response = await http
+          .post(
+            Uri.parse(_sheetEndpoint),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode(payload),
+          )
+          .timeout(const Duration(seconds: 12));
+      if (!mounted) {
+        return;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        debugPrint('Test data submission failed: HTTP ${response.statusCode}');
+      }
+    } catch (error) {
+      debugPrint('Test data submission failed: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSubmitting = false;
+        });
+      }
+    }
   }
 
   void _switchVariant(PrototypeVariant variant) {
@@ -132,30 +392,119 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
     });
   }
 
-  void _recordToolSwitch(int nextIndex) {
-    if (!_isTestRunning ||
-        _lastStrokeEndedAt == null ||
-        nextIndex == _selectedPresetIndex) {
+  void _handleToolPointerDown(int index) {
+    if (!_isTestRunning) {
       return;
     }
-    _switchesSinceStroke += 1;
-    if (_switchesSinceStroke >= 2 && !_misoperationCounted) {
-      _misoperationCount += 1;
-      _misoperationCounted = true;
+    if (index < 0 || index >= _presets.length) {
+      return;
+    }
+    _lastToolPointerDownAt = DateTime.now();
+  }
+
+  void _recordToolSwitch(int nextIndex, {bool isTemporaryMode = false}) {
+    if (!_isTestRunning || nextIndex == _selectedPresetIndex) {
+      return;
+    }
+    final toolPointerDownAt = _lastToolPointerDownAt ?? DateTime.now();
+    var misoperation = false;
+    if (_lastStrokeEndedAt != null) {
+      _switchesSinceStroke += 1;
+      misoperation = _switchesSinceStroke >= 2;
+      if (misoperation && !_misoperationCounted) {
+        _misoperationCounted = true;
+      }
+    }
+    _toolSwitchLogs.add(
+      ToolSwitchLog(
+        trial: ++_trialCounter,
+        timestamp: toolPointerDownAt,
+        elapsedMs: _testStartedAt == null
+            ? null
+            : toolPointerDownAt.difference(_testStartedAt!).inMilliseconds,
+        isTemporaryMode: isTemporaryMode,
+        from: _toolNameForPreset(_presets[_selectedPresetIndex]),
+        to: _toolNameForPreset(_presets[nextIndex], temporary: isTemporaryMode),
+        accessDurationMs: _accessDurationSinceLastStroke(toolPointerDownAt),
+        misoperation: misoperation,
+      ),
+    );
+  }
+
+  void _recordToolSwitchFrom(
+    int previousIndex,
+    int nextIndex, {
+    bool isTemporaryMode = false,
+  }) {
+    if (!_isTestRunning || nextIndex == previousIndex) {
+      return;
+    }
+    final toolPointerDownAt = _lastToolPointerDownAt ?? DateTime.now();
+    var misoperation = false;
+    if (_lastStrokeEndedAt != null) {
+      _switchesSinceStroke += 1;
+      misoperation = _switchesSinceStroke >= 2;
+      if (misoperation && !_misoperationCounted) {
+        _misoperationCounted = true;
+      }
+    }
+    _toolSwitchLogs.add(
+      ToolSwitchLog(
+        trial: ++_trialCounter,
+        timestamp: toolPointerDownAt,
+        elapsedMs: _testStartedAt == null
+            ? null
+            : toolPointerDownAt.difference(_testStartedAt!).inMilliseconds,
+        isTemporaryMode: isTemporaryMode,
+        from: _toolNameForPreset(_presets[previousIndex]),
+        to: _toolNameForPreset(_presets[nextIndex], temporary: isTemporaryMode),
+        accessDurationMs: _accessDurationSinceLastStroke(toolPointerDownAt),
+        misoperation: misoperation,
+      ),
+    );
+  }
+
+  int? _accessDurationSinceLastStroke(DateTime toolPointerDownAt) {
+    final strokeEndedAt = _lastStrokeEndedAt;
+    if (strokeEndedAt == null || toolPointerDownAt.isBefore(strokeEndedAt)) {
+      return null;
+    }
+    return toolPointerDownAt.difference(strokeEndedAt).inMilliseconds;
+  }
+
+  void _handleInkPointerDown(DateTime timestamp) {
+    if (!_isTestRunning) {
+      return;
+    }
+    final pendingLog = _toolSwitchLogs.isEmpty ? null : _toolSwitchLogs.last;
+    if (pendingLog != null && pendingLog.switchDurationMs == null) {
+      pendingLog.switchDurationMs = timestamp
+          .difference(pendingLog.timestamp)
+          .inMilliseconds;
     }
   }
 
-  void _recordToolSwitchFrom(int previousIndex, int nextIndex) {
-    if (!_isTestRunning ||
-        _lastStrokeEndedAt == null ||
-        nextIndex == previousIndex) {
+  void _handleInkPointerUp(DateTime timestamp) {
+    if (!_isTestRunning) {
       return;
     }
-    _switchesSinceStroke += 1;
-    if (_switchesSinceStroke >= 2 && !_misoperationCounted) {
-      _misoperationCount += 1;
-      _misoperationCounted = true;
+    _lastStrokeEndedAt = timestamp;
+  }
+
+  String _toolNameForPreset(InkPreset preset, {bool temporary = false}) {
+    if (preset.tool == InkTool.eraser) {
+      return temporary ? 'Temporary Eraser' : 'Eraser';
     }
+    if (preset.tool == InkTool.highlighter) {
+      return 'Highlighter';
+    }
+    if (preset.color.toARGB32() == const Color(0xFFE53935).toARGB32()) {
+      return 'Red';
+    }
+    if (preset.color.toARGB32() == const Color(0xFF1E88E5).toARGB32()) {
+      return 'Blue';
+    }
+    return 'Black';
   }
 
   void _handleStrokeActiveChanged(bool active) {
@@ -169,11 +518,6 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
         return;
       }
       if (active) {
-        if (_lastStrokeEndedAt != null && _switchesSinceStroke > 0) {
-          _transitionTimesMs.add(
-            now.difference(_lastStrokeEndedAt!).inMilliseconds,
-          );
-        }
         _switchesSinceStroke = 0;
         _misoperationCounted = false;
       } else {
@@ -185,12 +529,16 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
   }
 
   void _startBottomHold() {
+    if (_bottomPresetTrayOpen) {
+      return;
+    }
     final eraserIndex = _eraserPresetIndex;
     if (eraserIndex < 0) {
       return;
     }
     setState(() {
       _holdOriginalPresetIndex = _selectedPresetIndex;
+      _recordToolSwitch(eraserIndex, isTemporaryMode: true);
       _selectedPresetIndex = eraserIndex;
       _hoverPresetIndex = null;
       _bottomPresetTrayOpen = true;
@@ -205,13 +553,16 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
     final eraserIndex = _eraserPresetIndex;
     setState(() {
       _hoverPresetIndex = index;
-      _selectedPresetIndex = index ?? eraserIndex;
+      _selectedPresetIndex = eraserIndex;
     });
   }
 
   void _endBottomHold(int? index) {
     final originalIndex = _holdOriginalPresetIndex;
     final nextIndex = index ?? originalIndex;
+    if (_isTestRunning) {
+      _lastToolPointerDownAt = DateTime.now();
+    }
     if (originalIndex != null &&
         nextIndex != null &&
         nextIndex != originalIndex) {
@@ -276,35 +627,47 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final compact = constraints.maxWidth < 860;
-            return Column(
+            return Stack(
               children: [
-                _TopTestBar(
-                  variant: _variant,
-                  onVariantChanged: _switchVariant,
-                  inkEnabled: _inkEnabled,
-                  presets: _presets,
-                  selectedPresetIndex: _selectedPresetIndex,
-                  hasStrokes: _strokes.isNotEmpty,
-                  isTestRunning: _isTestRunning,
-                  onEnabledChanged: (enabled) =>
-                      setState(() => _inkEnabled = enabled),
-                  onPresetSelected: _selectPreset,
-                  onCustomize: _openPresetEditor,
-                  onUndo: _undoStroke,
-                  onClear: _clearStrokes,
-                  onToggleTest: _toggleTest,
-                ),
-                Expanded(
-                  child: Padding(
-                    padding: EdgeInsets.fromLTRB(
-                      compact ? 12 : 28,
-                      compact ? 12 : 24,
-                      compact ? 12 : 28,
-                      compact ? 12 : 24,
+                Column(
+                  children: [
+                    _TopTestBar(
+                      variant: _variant,
+                      onVariantChanged: _switchVariant,
+                      inkEnabled: _inkEnabled,
+                      presets: _presets,
+                      selectedPresetIndex: _selectedPresetIndex,
+                      hasStrokes: _strokes.isNotEmpty,
+                      isTestRunning: _isTestRunning,
+                      onEnabledChanged: (enabled) =>
+                          setState(() => _inkEnabled = enabled),
+                      onPresetSelected: _selectPreset,
+                      onPresetPointerDown: _handleToolPointerDown,
+                      onCustomize: _openPresetEditor,
+                      onUndo: _undoStroke,
+                      onClear: _clearStrokes,
+                      onToggleTest: () => _toggleTest(),
+                      isSubmitting: _isSubmitting,
+                      isCountdownActive: _isCountdownActive,
+                      elapsedSeconds: _testElapsedSeconds,
                     ),
-                    child: _buildLectureCanvas(),
-                  ),
+                    Expanded(
+                      child: Padding(
+                        padding: EdgeInsets.fromLTRB(
+                          compact ? 12 : 28,
+                          compact ? 12 : 24,
+                          compact ? 12 : 28,
+                          compact ? 12 : 24,
+                        ),
+                        child: _buildLectureCanvas(),
+                      ),
+                    ),
+                  ],
                 ),
+                if (_isCountdownActive)
+                  Positioned.fill(
+                    child: _CountdownOverlay(seconds: _countdownSeconds),
+                  ),
               ],
             );
           },
@@ -332,6 +695,8 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
                   ..addAll(strokes);
               }),
               onStrokeActiveChanged: _handleStrokeActiveChanged,
+              onInkPointerDown: _handleInkPointerDown,
+              onInkPointerUp: _handleInkPointerUp,
               child: _LectureSlide(scrollLocked: _isStrokeActive),
             ),
           ),
@@ -347,24 +712,10 @@ class _LectureInkPrototypeScreenState extends State<LectureInkPrototypeScreen> {
                   trayOpen: _bottomPresetTrayOpen,
                   hoverPresetIndex: _hoverPresetIndex,
                   onPresetSelected: _selectPreset,
+                  onPointerDown: _handleToolPointerDown,
                   onHoldStarted: _startBottomHold,
                   onHoldTargetChanged: _updateBottomHoldTarget,
                   onHoldEnded: _endBottomHold,
-                ),
-              ),
-            ),
-          if (_isTestRunning)
-            Positioned(
-              right: 22,
-              bottom: 22,
-              child: InkExclusionZone(
-                padding: const EdgeInsets.all(8),
-                child: _TestDataPanel(
-                  latestTransitionMs: _latestTransitionMs,
-                  averageTransitionMs: _averageTransitionMs,
-                  transitionCount: _transitionTimesMs.length,
-                  switchesSinceStroke: _switchesSinceStroke,
-                  misoperationCount: _misoperationCount,
                 ),
               ),
             ),
@@ -384,10 +735,14 @@ class _TopTestBar extends StatelessWidget {
   final bool isTestRunning;
   final ValueChanged<bool> onEnabledChanged;
   final ValueChanged<int> onPresetSelected;
+  final ValueChanged<int> onPresetPointerDown;
   final VoidCallback onCustomize;
   final VoidCallback onUndo;
   final VoidCallback onClear;
   final VoidCallback onToggleTest;
+  final bool isSubmitting;
+  final bool isCountdownActive;
+  final int elapsedSeconds;
 
   const _TopTestBar({
     required this.variant,
@@ -399,15 +754,31 @@ class _TopTestBar extends StatelessWidget {
     required this.isTestRunning,
     required this.onEnabledChanged,
     required this.onPresetSelected,
+    required this.onPresetPointerDown,
     required this.onCustomize,
     required this.onUndo,
     required this.onClear,
     required this.onToggleTest,
+    required this.isSubmitting,
+    required this.isCountdownActive,
+    required this.elapsedSeconds,
   });
 
   bool get _isVariantA => variant == PrototypeVariant.a;
   String get _title =>
       _isVariantA ? 'A안 · 도구 전환 방식: 상단 메뉴' : 'B안 · 도구 전환 방식: 좌측 하단 버튼';
+  String get _elapsedLabel {
+    final hours = elapsedSeconds ~/ 3600;
+    final minutes = (elapsedSeconds % 3600) ~/ 60;
+    final seconds = elapsedSeconds % 60;
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:'
+          '${minutes.toString().padLeft(2, '0')}:'
+          '${seconds.toString().padLeft(2, '0')}';
+    }
+    return '${minutes.toString().padLeft(2, '0')}:'
+        '${seconds.toString().padLeft(2, '0')}';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -455,6 +826,7 @@ class _TopTestBar extends StatelessWidget {
                   showUtilityActions: false,
                   onEnabledChanged: onEnabledChanged,
                   onPresetSelected: onPresetSelected,
+                  onPresetPointerDown: onPresetPointerDown,
                   onCustomize: onCustomize,
                   onUndo: onUndo,
                   onClear: onClear,
@@ -475,8 +847,30 @@ class _TopTestBar extends StatelessWidget {
               ),
             ),
           ),
+          const SizedBox(width: 12),
+          Container(
+            height: 42,
+            constraints: const BoxConstraints(minWidth: 86),
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFD9E1F2)),
+            ),
+            child: Text(
+              _elapsedLabel,
+              style: const TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.w900,
+                color: Color(0xFF172033),
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
           FilledButton(
-            onPressed: onToggleTest,
+            onPressed: isSubmitting || isCountdownActive ? null : onToggleTest,
             style: FilledButton.styleFrom(
               minimumSize: const Size(112, 42),
               backgroundColor: isTestRunning
@@ -487,9 +881,76 @@ class _TopTestBar extends StatelessWidget {
                 borderRadius: BorderRadius.circular(8),
               ),
             ),
-            child: Text(isTestRunning ? '테스트 종료' : '테스트 시작'),
+            child: Text(
+              isSubmitting ? '전송 중' : (isTestRunning ? '테스트 종료' : '테스트 시작'),
+            ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _CountdownOverlay extends StatelessWidget {
+  final int seconds;
+
+  const _CountdownOverlay({required this.seconds});
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: Colors.black.withValues(alpha: 0.72),
+      child: Center(
+        child: Container(
+          width: 430,
+          padding: const EdgeInsets.fromLTRB(28, 26, 28, 28),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(12),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.24),
+                blurRadius: 24,
+                offset: const Offset(0, 12),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                '5초 뒤 테스트가 시작됩니다.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.w900,
+                  color: Color(0xFF111827),
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '테스트 후 테스트 종료 버튼을 눌러주세요.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFF4B5563),
+                ),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                '$seconds',
+                style: const TextStyle(
+                  fontSize: 92,
+                  height: 1,
+                  fontWeight: FontWeight.w900,
+                  color: Color(0xFF4169E1),
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -501,6 +962,7 @@ class _BottomPresetLauncher extends StatelessWidget {
   final bool trayOpen;
   final int? hoverPresetIndex;
   final ValueChanged<int> onPresetSelected;
+  final ValueChanged<int> onPointerDown;
   final VoidCallback onHoldStarted;
   final ValueChanged<int?> onHoldTargetChanged;
   final ValueChanged<int?> onHoldEnded;
@@ -511,6 +973,7 @@ class _BottomPresetLauncher extends StatelessWidget {
     required this.trayOpen,
     required this.hoverPresetIndex,
     required this.onPresetSelected,
+    required this.onPointerDown,
     required this.onHoldStarted,
     required this.onHoldTargetChanged,
     required this.onHoldEnded,
@@ -601,6 +1064,7 @@ class _BottomPresetLauncher extends StatelessWidget {
                   selected:
                       selectedPresetIndex == index || hoverPresetIndex == index,
                   emphasized: hoverPresetIndex == index,
+                  onPointerDown: () => onPointerDown(index),
                   onTap: () => onPresetSelected(index),
                 ),
               ),
@@ -609,7 +1073,10 @@ class _BottomPresetLauncher extends StatelessWidget {
             top: _centerButtonCenter.dy - _buttonSize / 2,
             child: Listener(
               behavior: HitTestBehavior.opaque,
-              onPointerDown: (_) => onHoldStarted(),
+              onPointerDown: (_) {
+                onPointerDown(selectedPresetIndex);
+                onHoldStarted();
+              },
               onPointerMove: (event) {
                 final target = targetFor(event.position);
                 onHoldTargetChanged(target);
@@ -676,124 +1143,18 @@ class _RadialEraserButton extends StatelessWidget {
   }
 }
 
-class _TestDataPanel extends StatelessWidget {
-  final int? latestTransitionMs;
-  final int? averageTransitionMs;
-  final int transitionCount;
-  final int switchesSinceStroke;
-  final int misoperationCount;
-
-  const _TestDataPanel({
-    required this.latestTransitionMs,
-    required this.averageTransitionMs,
-    required this.transitionCount,
-    required this.switchesSinceStroke,
-    required this.misoperationCount,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.94),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFFE1E7F5)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.08),
-            blurRadius: 16,
-            offset: const Offset(0, 8),
-          ),
-        ],
-      ),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              '수집 데이터',
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w900,
-                color: Color(0xFF172033),
-              ),
-            ),
-            const SizedBox(height: 8),
-            _MetricLine(
-              label: '최근 전환 시간',
-              value: _formatTime(latestTransitionMs),
-            ),
-            _MetricLine(
-              label: '평균 전환 시간',
-              value: _formatTime(averageTransitionMs),
-            ),
-            _MetricLine(label: '전환 기록', value: '$transitionCount회'),
-            _MetricLine(label: '필기 전 전환', value: '$switchesSinceStroke회'),
-            _MetricLine(label: '오조작', value: '$misoperationCount회'),
-          ],
-        ),
-      ),
-    );
-  }
-
-  static String _formatTime(int? milliseconds) {
-    if (milliseconds == null) {
-      return '-';
-    }
-    return '${(milliseconds / 1000).toStringAsFixed(2)}초';
-  }
-}
-
-class _MetricLine extends StatelessWidget {
-  final String label;
-  final String value;
-
-  const _MetricLine({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 3),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          SizedBox(
-            width: 88,
-            child: Text(
-              label,
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                color: Color(0xFF64748B),
-              ),
-            ),
-          ),
-          Text(
-            value,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w900,
-              color: Color(0xFF172033),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _BottomPresetChoice extends StatelessWidget {
   final InkPreset preset;
   final bool selected;
   final bool emphasized;
+  final VoidCallback onPointerDown;
   final VoidCallback onTap;
 
   const _BottomPresetChoice({
     required this.preset,
     required this.selected,
     this.emphasized = false,
+    required this.onPointerDown,
     required this.onTap,
   });
 
@@ -801,37 +1162,41 @@ class _BottomPresetChoice extends StatelessWidget {
   Widget build(BuildContext context) {
     final size = selected || emphasized ? 70.0 : 50.0;
     final previewSize = selected || emphasized ? 36.0 : 25.0;
-    return GestureDetector(
+    return Listener(
       behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      child: Container(
-        width: size,
-        height: size,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: Colors.white,
-          shape: BoxShape.circle,
-          border: Border.all(color: const Color(0xFFD9E1F0), width: 1.2),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(
-                alpha: selected || emphasized ? 0.18 : 0.08,
+      onPointerDown: (_) => onPointerDown(),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: Container(
+          width: size,
+          height: size,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            shape: BoxShape.circle,
+            border: Border.all(color: const Color(0xFFD9E1F0), width: 1.2),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(
+                  alpha: selected || emphasized ? 0.18 : 0.08,
+                ),
+                blurRadius: selected || emphasized ? 12 : 7,
+                offset: Offset(0, selected || emphasized ? 6 : 3),
               ),
-              blurRadius: selected || emphasized ? 12 : 7,
-              offset: Offset(0, selected || emphasized ? 6 : 3),
-            ),
-          ],
+            ],
+          ),
+          child: preset.isEraser
+              ? Icon(
+                  Icons.cleaning_services_rounded,
+                  size: selected || emphasized ? 28 : 20,
+                  color: const Color(0xFF64748B),
+                )
+              : CustomPaint(
+                  size: Size(previewSize, previewSize),
+                  painter: InkPresetPreviewPainter(preset),
+                ),
         ),
-        child: preset.isEraser
-            ? Icon(
-                Icons.cleaning_services_rounded,
-                size: selected || emphasized ? 28 : 20,
-                color: const Color(0xFF64748B),
-              )
-            : CustomPaint(
-                size: Size(previewSize, previewSize),
-                painter: InkPresetPreviewPainter(preset),
-              ),
       ),
     );
   }
@@ -1045,19 +1410,7 @@ class _LectureSlideState extends State<_LectureSlide> {
                         child: SizedBox(
                           width: _designWidth,
                           child: Column(
-                            children: const [
-                              _ProblemPage(
-                                number: '0787',
-                                prompt: _ProblemText(),
-                                feeCard: _AdmissionFeeCard(),
-                              ),
-                              SizedBox(height: 34),
-                              _ProblemPage(
-                                number: '0788',
-                                prompt: _SecondProblemText(),
-                                feeCard: _BusFareCard(),
-                              ),
-                            ],
+                            children: const [_EquationProblemPage()],
                           ),
                         ),
                       ),
@@ -1073,16 +1426,8 @@ class _LectureSlideState extends State<_LectureSlide> {
   }
 }
 
-class _ProblemPage extends StatelessWidget {
-  final String number;
-  final Widget prompt;
-  final Widget feeCard;
-
-  const _ProblemPage({
-    required this.number,
-    required this.prompt,
-    required this.feeCard,
-  });
+class _EquationProblemPage extends StatelessWidget {
+  const _EquationProblemPage();
 
   @override
   Widget build(BuildContext context) {
@@ -1090,35 +1435,21 @@ class _ProblemPage extends StatelessWidget {
       width: 960,
       height: 560,
       child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: const Color(0xFFFDFEFE),
-          border: Border.all(color: const Color(0xFFE6EDF7)),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(52, 42, 52, 42),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                number,
-                style: const TextStyle(
-                  fontSize: 30,
-                  fontWeight: FontWeight.w900,
-                  color: Color(0xFF4E8A38),
-                ),
+        decoration: const BoxDecoration(color: Color(0xFFFFFFFF)),
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 18),
+            child: Container(
+              width: 948,
+              height: 297,
+              padding: const EdgeInsets.fromLTRB(14, 16, 14, 14),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(3),
               ),
-              const SizedBox(height: 18),
-              Expanded(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(child: prompt),
-                    const SizedBox(width: 34),
-                    feeCard,
-                  ],
-                ),
-              ),
-            ],
+              child: const _EquationProblemContent(),
+            ),
           ),
         ),
       ),
@@ -1126,212 +1457,119 @@ class _ProblemPage extends StatelessWidget {
   }
 }
 
-class _ProblemText extends StatelessWidget {
-  const _ProblemText();
+class _EquationProblemContent extends StatelessWidget {
+  const _EquationProblemContent();
+
+  static const _textColor = Color(0xFF111827);
 
   @override
   Widget build(BuildContext context) {
-    const style = TextStyle(
-      fontSize: 28,
-      height: 1.6,
-      fontWeight: FontWeight.w800,
-      color: Color(0xFF1F2937),
-    );
-    return Text.rich(
-      TextSpan(
-        style: style,
-        children: [
-          const TextSpan(text: '어느 동물원의 입장료는 오른쪽과\n'),
-          const TextSpan(text: '같다. 지난달 이 동물원에 입장한 어른은 '),
-          TextSpan(
-            text: 'x',
-            style: style.copyWith(fontStyle: FontStyle.italic),
-          ),
-          const TextSpan(
-            text:
-                '명이고 청소년은 어른의 2배보다 6명이 많았고, 어린이는 어른의 3배보다 2명이 적었다. 지난달의 동물원 입장료의 총액을 ',
-          ),
-          TextSpan(
-            text: 'x',
-            style: style.copyWith(fontStyle: FontStyle.italic),
-          ),
-          const TextSpan(text: '를 사용한 식으로 나타내시오.'),
-        ],
-      ),
-    );
-  }
-}
-
-class _SecondProblemText extends StatelessWidget {
-  const _SecondProblemText();
-
-  @override
-  Widget build(BuildContext context) {
-    const style = TextStyle(
-      fontSize: 28,
-      height: 1.6,
-      fontWeight: FontWeight.w800,
-      color: Color(0xFF1F2937),
-    );
-    return Text.rich(
-      TextSpan(
-        style: style,
-        children: [
-          const TextSpan(text: '어느 시내버스의 이용 요금은 오른쪽과\n'),
-          const TextSpan(text: '같다. 오늘 이 버스를 이용한 어른은 '),
-          TextSpan(
-            text: 'x',
-            style: style.copyWith(fontStyle: FontStyle.italic),
-          ),
-          const TextSpan(
-            text:
-                '명이고 청소년은 어른보다 12명이 적었으며, 어린이는 청소년의 2배보다 5명이 많았다. 오늘의 버스 요금 총액을 ',
-          ),
-          TextSpan(
-            text: 'x',
-            style: style.copyWith(fontStyle: FontStyle.italic),
-          ),
-          const TextSpan(text: '를 사용한 식으로 나타내시오.'),
-        ],
-      ),
-    );
-  }
-}
-
-class _AdmissionFeeCard extends StatelessWidget {
-  const _AdmissionFeeCard();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 250,
-      padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
-      decoration: BoxDecoration(
-        color: const Color(0xFFFFFEF8),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: const Color(0xFFD7DDE7), width: 2),
+    return DefaultTextStyle(
+      style: const TextStyle(
+        color: _textColor,
+        fontSize: 21,
+        height: 1.24,
+        fontWeight: FontWeight.w900,
+        letterSpacing: 0,
       ),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            '동물원 입장료',
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.w900,
-              color: Color(0xFF1F2937),
+          Text.rich(
+            TextSpan(
+              children: [
+                const TextSpan(text: '[문제 1] 다음 식을 만족하는 '),
+                TextSpan(text: 'x', style: _mathStyle(fontSize: 22)),
+                const TextSpan(text: '의 값을 구하시오.'),
+              ],
             ),
           ),
           const SizedBox(height: 16),
-          const _FeeRow(label: '어른', value: '5000원'),
-          const _FeeRow(label: '청소년', value: '3000원'),
-          const _FeeRow(label: '어린이', value: '2000원'),
-          const SizedBox(height: 16),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: const [
-              Icon(Icons.forest_rounded, color: Color(0xFF79A858), size: 28),
-              Icon(Icons.park_rounded, color: Color(0xFFF6A13A), size: 30),
-              Icon(
-                Icons.child_care_rounded,
-                color: Color(0xFFEA6A52),
-                size: 28,
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _BusFareCard extends StatelessWidget {
-  const _BusFareCard();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 250,
-      padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
-      decoration: BoxDecoration(
-        color: const Color(0xFFFFFEF8),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: const Color(0xFFD7DDE7), width: 2),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
+          const Center(child: _EquationLine()),
+          const SizedBox(height: 12),
+          const Text('※ 풀이 조건: > 1. 암산하지 말고 모든 풀이 과정을 화면에 적어주세요.'),
+          const SizedBox(height: 8),
           const Text(
-            '시내버스 요금',
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.w900,
-              color: Color(0xFF1F2937),
-            ),
+            '2. 첫 줄에는 반드시 "양변에 분모의 최소공배수(6)를 곱하여 분모를 없앤 식"을 먼저 나열한 뒤, 전개',
           ),
-          const SizedBox(height: 16),
-          const _FeeRow(label: '어른', value: '1500원'),
-          const _FeeRow(label: '청소년', value: '900원'),
-          const _FeeRow(label: '어린이', value: '600원'),
-          const SizedBox(height: 16),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: const [
-              Icon(
-                Icons.directions_bus_rounded,
-                color: Color(0xFF2563EB),
-                size: 30,
-              ),
-              Icon(Icons.route_rounded, color: Color(0xFF16A34A), size: 28),
-              Icon(
-                Icons.confirmation_number_rounded,
-                color: Color(0xFFF97316),
-                size: 28,
-              ),
-            ],
-          ),
+          const Text('를 시작해 주세요.'),
         ],
       ),
     );
   }
+
+  static TextStyle _mathStyle({double fontSize = 28}) {
+    return const TextStyle(
+      color: _textColor,
+      fontWeight: FontWeight.w900,
+      fontFamily: 'Times New Roman',
+      fontStyle: FontStyle.italic,
+      letterSpacing: 0,
+    ).copyWith(fontSize: fontSize);
+  }
 }
 
-class _FeeRow extends StatelessWidget {
-  final String label;
-  final String value;
-
-  const _FeeRow({required this.label, required this.value});
+class _EquationLine extends StatelessWidget {
+  const _EquationLine();
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
+    return DefaultTextStyle.merge(
+      style: _EquationProblemContent._mathStyle(fontSize: 28),
       child: Row(
-        children: [
-          SizedBox(
-            width: 82,
-            child: Text(
-              '$label:',
-              style: const TextStyle(
-                fontSize: 22,
-                fontWeight: FontWeight.w900,
-                color: Color(0xFF1F2937),
-              ),
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: const [
+          _Fraction(
+            numerator: TextSpan(
+              children: [
+                TextSpan(text: '3'),
+                TextSpan(text: '('),
+                TextSpan(text: 'x'),
+                TextSpan(text: ' - 1)'),
+              ],
             ),
+            denominator: '2',
           ),
-          Expanded(
-            child: Text(
-              value,
-              textAlign: TextAlign.right,
-              style: const TextStyle(
-                fontSize: 22,
-                fontWeight: FontWeight.w900,
-                color: Color(0xFF1F2937),
-              ),
+          SizedBox(width: 17),
+          Text('-'),
+          SizedBox(width: 17),
+          _Fraction(
+            numerator: TextSpan(
+              children: [
+                TextSpan(text: 'x'),
+                TextSpan(text: ' + 4'),
+              ],
             ),
+            denominator: '3',
           ),
+          SizedBox(width: 17),
+          Text('= 1'),
         ],
       ),
+    );
+  }
+}
+
+class _Fraction extends StatelessWidget {
+  final TextSpan numerator;
+  final String denominator;
+
+  const _Fraction({required this.numerator, required this.denominator});
+
+  @override
+  Widget build(BuildContext context) {
+    final style = DefaultTextStyle.of(context).style;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2),
+          child: Text.rich(numerator, style: style),
+        ),
+        Container(width: 112, height: 2, color: const Color(0xFF111827)),
+        Text(denominator, style: style.copyWith(fontStyle: FontStyle.normal)),
+      ],
     );
   }
 }
